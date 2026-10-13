@@ -1,0 +1,15 @@
+{
+  "w_wait": 2.9465,
+  "w_ride": 0.5,
+  "w_delay": 0.6388,
+  "w_load": 15.1428,
+  "w_over": 60.0,
+  "a_urg": 1.7815,
+  "a_age": 0.7471,
+  "a_lb": 1.3364,
+  "w_switch": 3.0,
+  "w_release": 27.8808,
+  "x_express": 2.6638,
+  "w_backlog": 0.7829,
+  "w_protect": 0.0777
+}
