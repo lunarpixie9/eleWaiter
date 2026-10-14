@@ -64,7 +64,7 @@ class LiftModel:
     def stop_set(self) -> Set[int]:
         if self._stops is None:
             s = set(self.exits)
-            for o, d in self.pend:
+            for o, d, _ in self.pend:
                 s.add(o)
                 s.add(d)
             self._stops = s
@@ -76,13 +76,13 @@ class LiftModel:
         return self._tab
 
     # -- state transitions (return NEW models) -------------------------------
-    def with_pickup(self, o: int, d: int) -> "LiftModel":
+    def with_pickup(self, o: int, d: int, units: int = 1) -> "LiftModel":
         ppl = dict(self.ppl)
         ppl[o] = ppl.get(o, 0) + 1
         ppl[d] = ppl.get(d, 0) + 1
         return LiftModel(self.id, self.floor, self.dir, self.t0, self.speed, self.door,
                          self.cap, self.onboard, self.exits, ppl,
-                         self.pend + ((o, d),), self.express, self.ok)
+                         self.pend + ((o, d, units),), self.express, self.ok)
 
     def as_express(self) -> "LiftModel":
         """Lift committed to an emergency: other pickups are released."""
@@ -114,19 +114,19 @@ def model_from_lift(lift: LiftCar, now: float, exclude: Set[int] = frozenset()) 
     exits: Dict[int, int] = {}
     ppl: Dict[int, int] = {}
     for p in lift.passengers:
-        exits[p.destination] = exits.get(p.destination, 0) + 1
-        ppl[p.destination] = ppl.get(p.destination, 0) + 1
+        exits[p.destination] = exits.get(p.destination, 0) + p.space_units
+        ppl[p.destination] = ppl.get(p.destination, 0) + p.space_units
     pend = []
     for p in lift.assigned:
         if p.id in exclude:
             continue
-        pend.append((p.origin, p.destination))
-        ppl[p.origin] = ppl.get(p.origin, 0) + 1
-        ppl[p.destination] = ppl.get(p.destination, 0) + 1
+        pend.append((p.origin, p.destination, p.space_units))
+        ppl[p.origin] = ppl.get(p.origin, 0) + p.space_units
+        ppl[p.destination] = ppl.get(p.destination, 0) + p.space_units
     return LiftModel(lift.id, floor, lift.direction, t0, lift.speed, lift.door_time,
-                     lift.capacity, len(lift.passengers), exits, ppl, tuple(pend),
+                     lift.capacity, lift.load_units(), exits, ppl, tuple(pend),
                      express=lift.in_lane(),
-                     ok=lift.state != LiftState.OUT_OF_SERVICE)
+                     ok=lift.state != LiftState.OUT_OF_SERVICE and not lift.retiring)
 
 
 # --------------------------------------------------------------------------- costs
@@ -136,15 +136,16 @@ def predicted_load(m: LiftModel, tab: Dict[int, float], t_pickup: float) -> int:
     for s, c in m.exits.items():
         if tab[s] < t_pickup:
             load -= c
-    for po, pd in m.pend:
-        if tab[po] < t_pickup:
-            load += 1
-            if tab[po] < tab[pd] < t_pickup:
-                load -= 1
+    for po, pd, units in m.pend:
+        if tab[po] <= t_pickup:
+            load += units
+            if tab[po] < tab[pd] <= t_pickup:
+                load -= units
     return load
 
 
-def normal_cost(m: LiftModel, o: int, d: int, W: float, w: Dict[str, float]) -> float:
+def normal_cost(m: LiftModel, o: int, d: int, W: float, w: Dict[str, float],
+                units: int = 1) -> float:
     """Cost of letting lift `m` serve a call o->d under normal (LOOK) operation.
 
     cost = W * (w_wait*wait + w_ride*ride)       <- the passenger's OWN experience,
@@ -167,13 +168,13 @@ def normal_cost(m: LiftModel, o: int, d: int, W: float, w: Dict[str, float]) -> 
     load = predicted_load(m, tab1, to)
     cost = W * (w["w_wait"] * to + w["w_ride"] * ride) + w["w_delay"] * imposed \
         + w["w_load"] * max(0, load) / m.cap
-    if load >= m.cap:
+    if load + units > m.cap:
         cost += w["w_over"] * W
     return cost
 
 
 def express_cost(m: LiftModel, o: int, d: int, W: float, w: Dict[str, float],
-                 bpl: float = 0.0) -> float:
+                 bpl: float = 0.0, units: int = 1) -> float:
     """Cost of starting an emergency lane on lift `m`: straight to `o`, then `d`,
     with no routine pickups. Passengers already aboard are still dropped if their
     floor is on the way. `bpl` = waiting passengers per active lift: taking a lift
@@ -192,7 +193,7 @@ def express_cost(m: LiftModel, o: int, d: int, W: float, w: Dict[str, float],
         + w["w_backlog"] * bpl * 0.5 * (wait + ride)
     cost = W * (w["w_wait"] * wait + w["w_ride"] * ride) + w["w_delay"] * imposed \
         + w["w_load"] * onboard_after / m.cap
-    if onboard_after >= m.cap:
+    if onboard_after + units > m.cap:
         cost += w["w_over"] * W
     # benefit of a lane: the emergency ride is protected from later detours
     cost -= w["w_protect"] * W * ride

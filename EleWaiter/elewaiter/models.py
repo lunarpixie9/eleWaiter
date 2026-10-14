@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Set, Tuple
 class Zone(IntEnum):
     """Clinical/operational importance of a floor (set once per building)."""
     LOW = 0        # storage, parking, admin
-    NORMAL = 1     # lobby, wards, clinics, offices
+    NORMAL = 1     # lobby, wards, clinics
     HIGH = 2       # imaging, labs, maternity
     CRITICAL = 3   # emergency dept, ICU, operating theatres
 
@@ -36,6 +36,7 @@ class Floor:
     role: str = "other"          # lobby | er | icu | ot | imaging | ward | clinic | other
     # (start, end) simulation-time windows in which the zone is upgraded one level
     boost_windows: Tuple[Tuple[float, float], ...] = ()
+    roles: Tuple[str, ...] = ()   # multiple departments can share a small hospital floor
 
     def zone_at(self, t: float) -> Zone:
         z = self.zone
@@ -49,7 +50,7 @@ class Floor:
 @dataclass
 class BuildingConfig:
     name: str
-    kind: str                       # "hospital" | "office" | "college"
+    kind: str                       # "hospital"
     num_floors: int
     num_lifts: int
     capacity: int = 12
@@ -65,7 +66,7 @@ class BuildingConfig:
         return f.zone_at(t) if f else Zone.NORMAL
 
     def floors_with_role(self, role: str) -> List[int]:
-        return sorted(n for n, f in self.floors.items() if f.role == role)
+        return sorted(n for n, f in self.floors.items() if f.role == role or role in f.roles)
 
     def critical_floors(self) -> List[int]:
         return sorted(n for n, f in self.floors.items() if f.zone == Zone.CRITICAL)
@@ -93,7 +94,9 @@ class Passenger:
     origin: int
     destination: int
     arrival_time: float
-    is_emergency: bool = False          # ground truth: used ONLY for evaluation
+    is_emergency: bool = False          # simulation truth; never read by dispatchers
+    clinical_alert: bool = False        # simulated authorized alert visible to dispatch
+    space_units: int = 1                # patient, team and equipment travel together
     # --- runtime state -----------------------------------------------------
     urgency: Urgency = Urgency.ROUTINE  # inferred by the simulator on arrival
     assigned_lift: Optional[int] = None
@@ -126,9 +129,16 @@ class LiftCar:
     doors_close_at: float = 0.0
     next_arrival_at: float = 0.0
     travelled: float = 0.0
+    retiring: bool = False              # failed lift finishes onboard drop-offs only
+
+    def load_units(self) -> int:
+        return sum(p.space_units for p in self.passengers)
+
+    def has_room_for(self, p: Passenger) -> bool:
+        return self.load_units() + p.space_units <= self.capacity
 
     def is_full(self) -> bool:
-        return len(self.passengers) >= self.capacity
+        return self.load_units() >= self.capacity
 
     def in_lane(self) -> bool:
         """Emergency lane: the lift is committed to express (critical) passengers and
@@ -143,6 +153,6 @@ class LiftCar:
     def stop_floors(self) -> Set[int]:
         """Floors the lift must visit: drop-offs, plus pickups if it has room."""
         s = {p.destination for p in self.passengers}
-        if not self.is_full():
+        if not self.is_full() and not self.retiring:
             s.update(p.origin for p in self.assigned)
         return s

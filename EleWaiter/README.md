@@ -1,8 +1,8 @@
 # 🛗 EleWaiter: emergency-first intelligent lift dispatch
 
-A Python simulator and AI dispatcher that decides **which lift serves which passenger**, built for hospitals where an emergency transfer (ER to ICU/OT) must not wait behind routine traffic, while visitors and staff are not starved. It also works for any building (office and college presets are included).
+A Python simulator and AI dispatcher that decides **which lift serves which passenger** in hospitals, where an emergency transfer (ER to ICU/OT) must not wait behind routine traffic while visitors and staff are not starved.
 
-No hardware, no extra buttons or cards: urgency is **inferred from context** (which floors a trip touches, and when).
+This is a software-only simulation. Urgency comes from simulated clinical alerts when available and from hospital floor context otherwise.
 
 ## Quick start
 
@@ -10,18 +10,38 @@ No hardware, no extra buttons or cards: urgency is **inferred from context** (wh
 pip install -r requirements.txt
 streamlit run ui/app.py                 # interactive UI
 python run_benchmark.py --ablation      # multi-seed benchmark, hospital scenarios
-python run_benchmark.py --building "12-floor Office"
-python train_optimizer.py               # re-tune the AI weights (about 5 min)
-pytest -q                               # 129 tests
+python run_benchmark.py --building "15-floor Hospital"
+python validate_weights.py              # compare default and saved weights on both hospitals
+python train_optimizer.py --building "10-floor Hospital"  # optional offline tuning
+pytest -q
 ```
+
+## Using the frontend
+
+1. Run `streamlit run ui/app.py` and open the local URL shown in the terminal.
+2. Under **Hospital situation**, choose **Normal traffic (no emergency)** or **With emergency**. Both include ordinary staff, visitor and outpatient trips; the second also includes urgent lift trips.
+3. Enter the **number of floors** (3–30), **number of lifts**, and **max capacity per lift**. One simulated space is one unit of lift capacity. An ordinary rider uses one space; the default stretcher with staff uses three spaces total, or five for a larger team. Select floors for the ER, ICU, operating theatre and imaging/labs. Departments may share a floor, but clinical departments must span at least two floors. Floor 1 is the lobby; unassigned floors become wards or clinics.
+4. In **With emergency**, choose the emergency transfer load. **Stretcher + staff (3 spaces)** is the default. Every emergency is reported as urgent and uses a lift. A transfer load larger than lift capacity is rejected.
+5. Press **Run simulation**. The app uses **EleWaiter AI**, which includes A* assignment. **Optional test settings** contains the run length, repeatable trip pattern and comparison methods. Keep the trip pattern unchanged for fair comparisons.
+6. Read the **Overview** tab for completed and unfinished trips, average and P95 waiting times, emergency pickup and full-trip times, long waits, and lift movement. Expand the hospital layout, AI explanation, technical details or optional tuning only when needed. Timing statistics describe completed trips; unfinished trips are shown separately. One trip pattern is illustrative; use `validate_weights.py` or `run_benchmark.py` for repeated runs.
+
+This frontend simulates an alert for every emergency trip. It is not connected to a hospital alert system or lift hardware.
+
+Earlier tests on 10 held-out seeds per hospital at 300 simulated seconds used 80% alerts and three capacity units per patient transfer. The default weights gave an average emergency call-to-destination time of 14.2 s on the 10-floor hospital and 16.0 s on the 15-floor hospital. The legacy 10-floor weights gave 19.5 s in that setup, so they are no longer loaded by default. Those results predate the current 100% alert default and are not clinical service guarantees.
 
 ## The problem
 
 For each call, choose a lift so that average wait is low, **nobody is starved or repeatedly left behind**, and **emergencies get through fast**, without wrecking everyone else's service. Rules like "nearest lift" or first-come-first-served ignore direction, crowding and urgency.
 
+## Recommended hospital setup
+
+Use **EleWaiter AI** for dispatch. It combines the multi-objective cost heuristic, predicted pickup load, bounded A* search over pending calls, dynamic re-optimization, a cost-based emergency lane, priority aging, and the starvation guard. Its emergency decisions use simulated clinical alerts when present, otherwise inferred urgency from hospital floors and time. The dispatcher does not read ground-truth emergency labels.
+
+Keep **FCFS, Nearest, LOOK/Collective, and Priority-Nearest** as benchmark baselines so emergency gains and routine-passenger costs remain measurable. Use **GA and simulated annealing offline** to tune weights, then validate the selected weights on different seeds. They do not run when a lift call is dispatched. Each hospital has a separate weight file; until newly tuned and validated weights exist, the AI uses default weights. The previous 10-floor weights remain in the repository for historical comparison and are not loaded automatically.
+
 ## How it works
 
-**Urgency from context (no new hardware).** Every floor has a zone (LOW / NORMAL / HIGH / CRITICAL; ER, ICU and OT are CRITICAL). A trip leaving a CRITICAL zone for a HIGH/CRITICAL zone (ER to ICU/OT/imaging) is inferred **critical**; other trips touching a HIGH/CRITICAL zone are **elevated**. Zones can be upgraded in time windows (e.g. lecture floors before class). Waiting time raises priority automatically.
+**Urgency from alerts and context.** A simulated clinical alert marks a trip **critical**. Otherwise, every floor has a zone (LOW / NORMAL / HIGH / CRITICAL; ER, ICU and OT are CRITICAL). A trip leaving a CRITICAL zone for a HIGH/CRITICAL zone (ER to ICU/OT/imaging) is inferred **critical**; other trips touching a HIGH/CRITICAL zone are **elevated**. Zones can be upgraded in time windows for temporary clinical priorities. Waiting time raises priority automatically.
 
 **Dispatchers** (`elewaiter/dispatchers/`)
 
@@ -46,11 +66,13 @@ For each call, choose a lift so that average wait is low, **nobody is starved or
 
 ## Scenarios and buildings
 
-Hospital: **emergency surge**, **mass-casualty burst** (14 emergencies in about a minute), **visiting hours**, **shift change**, **lift failure**. General (any building): up-peak, down-peak, mixed. Buildings: 10- and 15-floor hospitals, 12-floor office, 8-floor college.
+Hospital scenarios: **emergency surge**, **mass-casualty burst** (14 emergencies in about a minute), **visiting hours**, **shift change**, and **lift failure**. Building presets: 10- and 15-floor hospitals. When emergency traffic is enabled, each simulation includes at least one emergency trip even if a short random sample would otherwise contain none.
 
-Emergencies in the traffic are **ground truth that dispatchers never see**; they include patient transfers (ER to ICU/OT/imaging, OT to ICU) and code-response trips to ordinary wards that floor rules cannot recognise. Routine traffic scales with `intensity`; emergencies are an independent process.
+Emergencies in the traffic are **ground truth that dispatchers never read**; they include patient transfers (ER to ICU/OT/imaging, OT to ICU) and code-response trips to ordinary wards that floor rules cannot recognise. Every emergency receives a simulated clinical alert by default. The CLI can lower alert coverage for a fallback test. Patient transfers can reserve multiple lift capacity units. Routine traffic scales with `intensity`; emergencies are an independent process.
 
-## Results (held-out seeds)
+## Historical results (before alert, transfer-space and timed-failure changes)
+
+The numbers below were produced by the earlier floor-only simulator with one capacity unit per trip and a lift unavailable from the start. They are retained as a historical reference and should **not** be treated as results for the current frontend defaults. Run `validate_weights.py` and `run_benchmark.py` for current results.
 
 Protocol: weights trained on seeds 1000-1002, winner picked on validation seeds 3000-3003, **all numbers below use unseen seeds 2000-2009**; 10-floor hospital, 600 s, routine intensity 1.5. Every dispatcher sees the identical passenger stream per seed. Overall = mean of the five hospital scenarios.
 
@@ -99,16 +121,14 @@ Per scenario (mean of 10 seeds):
 
 At light load a good conventional method is already close; do not expect large gains there. Average wait at 2.5x: AI 14.6 s vs Collective 22.8 s vs Priority-Nearest 62.6 s.
 
-**Other buildings** (office, college; no emergencies): the AI had the lowest average wait, p95 and starvation in every general scenario (e.g. office up-peak 5.2 s vs 5.9 s for Collective and 15.3 s for Nearest).
-
 **What the optimizer bought** (default vs tuned weights, 8 held-out seeds, hospital scenarios; on validation seeds the GA improved the composite fitness by about 10%, 75.7 to 67.9, versus 25% on its own training seeds, so expect modest transfer): average wait -24%, p95 -23%, starvation -63%, but emergency wait unchanged (6.3 s to 6.4 s). Tuning improved fairness and routine service. It also taught the AI to start emergency lanes **sparingly** (0.6-2.3% of door openings vs 4.9-12.1% with hand-set weights): most of the emergency benefit comes from urgency-weighted costs and priority boarding, with lanes used when cheap.
 
 ## Honest limitations
 
 - **Simulated traffic only.** Results show smarter dispatch helps under the traffic models here; they are not proof for a real building. Real hospital lift traffic, emergency rates and layouts would need calibration.
-- **Context-based urgency is imprecise.** Across the held-out runs, trips inferred as critical were real emergencies only about **23%** of the time (many routine staff moves between critical floors look the same), and the rules recognised about **77%** of real emergencies (code responses to wards are missed). The AI still performs well because decisions are cost-based and selective, but better signals (e.g. a code-alert feed) would help.
+- **Floor-only urgency is imprecise.** In the historical floor-only runs, trips inferred as critical were real emergencies only about **23%** of the time, and the rules recognised about **77%** of real emergencies. The new simulated alert is assumed to be correct when sent; a real alert feed would need its own validation.
 - Collective control is hard to beat on average wait at light load: the AI's win over it there is small (it wins on average wait in 6-10 of 10 seeds depending on scenario, and on emergency wait in 5-8 of 10).
-- Assumptions: destinations are known at call time (destination-dispatch style); passengers board a lift regardless of its direction of travel; one fixed starvation threshold (45 s); the tuned weights were trained on the 10-floor hospital only and reused unchanged for the other buildings.
+- Assumptions: destinations are known at call time (destination-dispatch style); passengers board a lift regardless of its direction of travel; one fixed starvation threshold (45 s). The mid-run lift outage is a controlled removal from new service, allowing onboard passengers to finish their trips.
 - No animated lift view (the activity chart shows door openings and emergency-lane trips).
 
 ## What changed from v1
@@ -120,7 +140,7 @@ The first version ran but had defects that made its benchmark untrustworthy. All
 ```
 elewaiter/
   models.py        zones, urgency inference, passenger, lift
-  buildings.py     hospital / office / college presets
+  buildings.py     10- and 15-floor hospital presets
   traffic.py       Poisson traffic + scenarios + ground-truth emergencies
   simulator.py     discrete-event engine (floor-by-floor, lanes, starvation guard)
   planner.py       ETA / predicted-load model and cost functions
@@ -129,8 +149,8 @@ elewaiter/
   metrics.py       wait, fairness, emergency and inference-quality metrics
   benchmark.py     multi-seed benchmark helpers
   charts.py        Plotly charts
-  data/            tuned_weights.json, training_log.json
+  data/            historical weights/logs; new hospital-v2 files after offline tuning
 ui/app.py          Streamlit UI
-tests/             129 tests (invariants, regressions, planner, A*, emergency logic)
+tests/             invariants, regressions, planner, A*, emergency logic
 run_benchmark.py   train_optimizer.py
 ```

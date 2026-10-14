@@ -22,16 +22,17 @@ import heapq
 from typing import List, Sequence
 
 from .metrics import SimulationResult, build_result
-from .models import BuildingConfig, LiftCar, LiftState, Passenger
+from .models import BuildingConfig, LiftCar, LiftState, Passenger, Urgency
 
-ARRIVE, STEP, DOORS, TICK = 0, 1, 2, 3
+ARRIVE, STEP, DOORS, TICK, FAIL = 0, 1, 2, 3, 4
 
 
 class ElevatorSimulator:
     def __init__(self, config: BuildingConfig, passengers: List[Passenger], dispatcher,
                  scenario: str = "", disabled_lifts: Sequence[int] = (),
                  starvation_limit: float = 45.0, tick: float = 3.0,
-                 max_overrun: float = 1800.0):
+                 max_overrun: float = 1800.0, failure_at: float | None = None,
+                 failure_lifts: Sequence[int] = ()):
         self.config = config
         self.passengers = passengers
         self.pax = {p.id: p for p in passengers}
@@ -57,6 +58,8 @@ class ElevatorSimulator:
         self.t_max = last + max_overrun
         self._dispatching = False
         self._redo = False
+        self.failure_at = failure_at
+        self.failure_lifts = tuple(failure_lifts)
 
     # ------------------------------------------------------------------ engine
     def _push(self, t: float, kind: int, a: int = 0):
@@ -66,6 +69,9 @@ class ElevatorSimulator:
     def run(self) -> SimulationResult:
         for p in self.passengers:
             self._push(p.arrival_time, ARRIVE, p.id)
+        if self.failure_at is not None:
+            for lift_id in self.failure_lifts:
+                self._push(self.failure_at, FAIL, lift_id)
         self._push(0.0, TICK)
         while self.eq:
             t, _, kind, a = heapq.heappop(self.eq)
@@ -74,16 +80,30 @@ class ElevatorSimulator:
             self.now = t
             if kind == ARRIVE:
                 p = self.pax[a]
-                p.urgency = self.config.infer_urgency(p.origin, p.destination, t)
+                p.urgency = (Urgency.CRITICAL if p.clinical_alert else
+                             self.config.infer_urgency(p.origin, p.destination, t))
                 self.waiting.append(p)
                 self._dispatch()
             elif kind == STEP:
                 self._on_step(self.lifts[a])
             elif kind == DOORS:
                 self._proceed(self.lifts[a])
+            elif kind == FAIL:
+                self._on_failure(self.lifts[a])
             else:
                 self._on_tick()
         return build_result(self)
+
+    def _on_failure(self, lift: LiftCar):
+        """Remove a lift from new service; finish trips already onboard."""
+        if lift.state == LiftState.OUT_OF_SERVICE:
+            return
+        lift.retiring = True
+        for p in list(lift.assigned):
+            self._release(p, left_behind=False)
+        if lift.state == LiftState.IDLE:
+            self._proceed(lift)
+        self._dispatch()
 
     # ---------------------------------------------------------------- dispatch
     def _locked(self, p: Passenger) -> bool:
@@ -129,7 +149,7 @@ class ElevatorSimulator:
             if p.assigned_lift is None or p.express:
                 continue
             lift = self.lifts[p.assigned_lift]
-            if lift.is_full():
+            if not lift.has_room_for(p):
                 continue
             new_lane = not lift.in_lane()
             p.express = True
@@ -165,14 +185,15 @@ class ElevatorSimulator:
             if self.now - p.arrival_time < self.starvation_limit:
                 continue
             lift = self.lifts[p.assigned_lift] if p.assigned_lift is not None else None
-            usable = lift is not None and lift.state != LiftState.OUT_OF_SERVICE and not lift.is_full()
+            usable = lift is not None and lift.state != LiftState.OUT_OF_SERVICE and not lift.retiring \
+                and lift.has_room_for(p)
             if usable and p.promoted:
                 continue
             if not usable:
                 if lift is not None:
                     self._release(p, left_behind=False)
                 cands = [l for l in self.lifts if l.state != LiftState.OUT_OF_SERVICE
-                         and not l.is_full() and not l.in_lane()]
+                         and not l.retiring and l.has_room_for(p) and not l.in_lane()]
                 if not cands:
                     continue
                 lift = min(cands, key=lambda l: (abs(l.floor - p.origin), l.id))
@@ -213,6 +234,10 @@ class ElevatorSimulator:
 
     def _proceed(self, lift: LiftCar):
         """Lift is at a floor with doors closed: open here, move on, or go idle."""
+        if lift.retiring and not lift.passengers:
+            lift.state = LiftState.OUT_OF_SERVICE
+            lift.direction = 0
+            return
         stops = lift.stop_floors()
         if lift.floor in stops:
             self._open_doors(lift)
@@ -231,8 +256,9 @@ class ElevatorSimulator:
         lift.floor += lift.direction
         lift.travelled += 1.0
         released = False
-        if lift.is_full():      # full lift bypasses hall calls on this floor
-            for p in [q for q in lift.assigned if q.origin == lift.floor]:
+        if lift.assigned:
+            for p in [q for q in lift.assigned if q.origin == lift.floor
+                      and not lift.has_room_for(q)]:
                 self._release(p, left_behind=True)
                 released = True
         self._proceed(lift)
@@ -247,7 +273,7 @@ class ElevatorSimulator:
             lift.passengers.remove(p)
             p.exit_time = self.now
             self.completed.append(p)
-        cands = [p for p in lift.assigned if p.origin == f]
+        cands = [] if lift.retiring else [p for p in lift.assigned if p.origin == f]
         lane = lift.in_lane()
         if lane:                # lane lifts board only express (critical) passengers
             for p in [q for q in cands if not q.express]:
@@ -257,22 +283,24 @@ class ElevatorSimulator:
             cands.sort(key=lambda p: (-int(p.urgency), p.arrival_time))
         else:
             cands.sort(key=lambda p: p.arrival_time)
-        boarded = []
+        boarded, left = [], []
         for p in cands:
-            if lift.is_full():
-                break
+            if not lift.has_room_for(p):
+                left.append(p)
+                continue
             lift.assigned.remove(p)
             lift.passengers.append(p)
             self.waiting.remove(p)
             p.board_time = self.now
             boarded.append(p)
-        for p in cands[len(boarded):]:          # no room: left behind
+        for p in left:          # no room for this whole transfer group
             self._release(p, left_behind=True)
-        dwell = lift.door_time + self.config.board_time * (len(exiting) + len(boarded))
+        dwell = lift.door_time + self.config.board_time * sum(
+            p.space_units for p in exiting + boarded)
         lift.doors_close_at = self.now + dwell
         self._push(lift.doors_close_at, DOORS, lift.id)
         self.timeline.append({"time": round(self.now, 1), "lift": lift.id, "floor": f,
-                              "load": len(lift.passengers), "boarded": len(boarded),
+                              "load": lift.load_units(), "boarded": len(boarded),
                               "exited": len(exiting), "lane": lane,
                               "routine_boarded_in_lane": sum(1 for p in boarded if lane and not p.express)})
         self._dispatch()

@@ -1,4 +1,5 @@
 """Tests for EleWaiter. Run:  pytest -q"""
+import ast
 import itertools
 import math
 import os
@@ -9,10 +10,11 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from elewaiter.benchmark import ALGORITHMS, make_dispatcher, run_once, run_benchmark, win_rate, summarize
-from elewaiter.buildings import PRESETS, hospital_10, college_8, office_12
+from elewaiter.buildings import PRESETS, custom_hospital, hospital_10
 from elewaiter.dispatchers import (AIDispatcher, Assignment, Collective, DEFAULT_WEIGHTS, Dispatcher,
                                    FCFS, Nearest, PriorityNearest, WEIGHT_BOUNDS)
 from elewaiter.models import (BuildingConfig, Floor, LiftCar, LiftState, Passenger, Urgency, Zone)
+from elewaiter.metrics import SimulationResult
 from elewaiter.optimizer import composite, fitness, genetic_algorithm, simulated_annealing
 from elewaiter.planner import (eta_table, look_order, model_from_lift, normal_cost, express_cost,
                                predicted_load)
@@ -30,6 +32,50 @@ def make_lifts(cfg, n=None):
             for i in range(n or cfg.num_lifts)]
 
 
+def test_only_hospital_presets_and_scenarios_are_exposed():
+    assert set(PRESETS) == {"10-floor Hospital", "15-floor Hospital"}
+    assert set(SCENARIOS) == {"emergency_surge", "mass_casualty", "visiting_hours",
+                              "shift_change", "lift_failure"}
+
+
+def test_streamlit_page_parses():
+    """Catch syntax errors before Streamlit tries to load the page."""
+    with open(os.path.join(os.path.dirname(__file__), "..", "ui", "app.py"), encoding="utf-8") as fh:
+        ast.parse(fh.read())
+
+
+def test_custom_hospital_settings_drive_both_traffic_modes():
+    cfg = custom_hospital(8, 2, 6, 2, 7, 8, 3)
+    assert (cfg.num_floors, cfg.num_lifts, cfg.capacity) == (8, 2, 6)
+    assert cfg.floors_with_role("er") == [2]
+    assert cfg.floors_with_role("icu") == [7]
+    assert cfg.floors_with_role("ot") == [8]
+    assert cfg.floors_with_role("imaging") == [3]
+    normal = TrafficGenerator(cfg, 4).generate("emergency_surge", 300, emergency_rate=0)
+    emergency = TrafficGenerator(cfg, 4).generate("emergency_surge", 300, transfer_space=3)
+    assert normal and not any(p.is_emergency for p in normal)
+    assert any(p.is_emergency for p in emergency)
+    assert all(p.clinical_alert for p in emergency if p.is_emergency)
+    assert all(p.space_units <= cfg.capacity for p in emergency)
+
+
+def test_three_floor_hospital_supports_shared_departments_and_emergency_lift_trips():
+    cfg = custom_hospital(3, 2, 6, 2, 3, 3, 2)
+    assert cfg.floors_with_role("er") == [2]
+    assert cfg.floors_with_role("imaging") == [2]
+    assert cfg.floors_with_role("icu") == [3]
+    assert cfg.floors_with_role("ot") == [3]
+    trips = TrafficGenerator(cfg, 4).generate("emergency_surge", 300, transfer_space=3)
+    assert trips and any(p.is_emergency for p in trips)
+    assert all(p.origin != p.destination for p in trips)
+    assert all(p.space_units <= cfg.capacity for p in trips)
+
+
+def test_custom_hospital_requires_two_clinical_floors():
+    with pytest.raises(ValueError, match="at least two different floors"):
+        custom_hospital(3, 2, 6, 2, 2, 2, 2)
+
+
 # ------------------------------------------------------------------ zones & urgency
 class TestUrgencyInference:
     def test_er_to_icu_is_critical(self, cfg):
@@ -44,15 +90,12 @@ class TestUrgencyInference:
     def test_staff_to_icu_is_elevated(self, cfg):
         assert cfg.infer_urgency(6, 9) == Urgency.ELEVATED
 
-    def test_time_window_upgrades_zone(self):
-        c = college_8()
-        assert c.zone_at(3, 50.0) == Zone.NORMAL
-        assert c.zone_at(3, 120.0) == Zone.HIGH
-        assert c.infer_urgency(1, 3, 120.0) == Urgency.ELEVATED
-        assert c.infer_urgency(1, 3, 50.0) == Urgency.ROUTINE
-
-    def test_office_has_no_critical_floors(self):
-        assert office_12().critical_floors() == []
+    def test_time_window_upgrades_hospital_zone(self, cfg):
+        cfg.floors[6].boost_windows = ((100.0, 180.0),)
+        assert cfg.zone_at(6, 50.0) == Zone.NORMAL
+        assert cfg.zone_at(6, 120.0) == Zone.HIGH
+        assert cfg.infer_urgency(1, 6, 120.0) == Urgency.ELEVATED
+        assert cfg.infer_urgency(1, 6, 50.0) == Urgency.ROUTINE
 
 
 # ------------------------------------------------------------------ traffic
@@ -79,10 +122,6 @@ class TestTraffic:
         in_burst = [p for p in pax if p.is_emergency and 60 <= p.arrival_time <= 120]
         assert len(in_burst) >= 10
 
-    def test_no_emergencies_in_office(self):
-        pax = TrafficGenerator(office_12(), 3).generate("up_peak", 300)
-        assert not any(p.is_emergency for p in pax)
-
     def test_emergency_rate_independent_of_intensity(self, cfg):
         lo = sum(p.is_emergency for p in TrafficGenerator(cfg, 4).generate("emergency_surge", 1200, 1.0))
         hi = sum(p.is_emergency for p in TrafficGenerator(cfg, 4).generate("emergency_surge", 1200, 3.0))
@@ -92,12 +131,34 @@ class TestTraffic:
         pax = TrafficGenerator(cfg, 3).generate("emergency_surge", 100)
         assert all(p.urgency == Urgency.ROUTINE for p in pax)   # set by the simulator on arrival
 
+    def test_clinical_alerts_are_reproducible_and_do_not_change_trips(self, cfg):
+        low = TrafficGenerator(cfg, 4).generate("mass_casualty", 300, alert_coverage=0)
+        high = TrafficGenerator(cfg, 4).generate("mass_casualty", 300, alert_coverage=1)
+        assert [(p.origin, p.destination, p.arrival_time) for p in low] == [
+            (p.origin, p.destination, p.arrival_time) for p in high]
+        assert not any(p.clinical_alert for p in low)
+        assert all(p.clinical_alert for p in high if p.is_emergency)
+        assert not any(p.clinical_alert for p in high if not p.is_emergency)
+
+    def test_alert_marks_ordinary_ward_code_response_critical(self, cfg):
+        p = Passenger(0, 1, 6, 0.0, is_emergency=True, clinical_alert=True)
+        sim = ElevatorSimulator(cfg, [p], AIDispatcher(DEFAULT_WEIGHTS))
+        sim.run()
+        assert p.urgency == Urgency.CRITICAL
+
+    def test_transfer_space_only_applies_to_patient_transfers(self, cfg):
+        pax = TrafficGenerator(cfg, 4).generate("mass_casualty", 300,
+                                                 transfer_space=3)
+        assert any(p.is_emergency and p.space_units == 3 for p in pax)
+        assert any(p.is_emergency and p.space_units == 1 for p in pax)
+
 
 # ------------------------------------------------------------------ simulator invariants
 def run_sim(cfg, algo, scenario="emergency_surge", seed=3, duration=300, intensity=1.0):
     spec = SCENARIOS[scenario]
     pax = TrafficGenerator(cfg, seed).generate(scenario, duration, intensity)
-    sim = ElevatorSimulator(cfg, pax, make_dispatcher(algo), scenario, spec.disabled_lifts)
+    sim = ElevatorSimulator(cfg, pax, make_dispatcher(algo), scenario, spec.disabled_lifts,
+                            failure_at=spec.failure_at, failure_lifts=spec.failure_lifts)
     res = sim.run()
     return sim, res
 
@@ -108,6 +169,17 @@ def test_capacity_never_exceeded(cfg, algo, intensity):
     """Regression: the original version let lifts carry up to 19 people with capacity 10."""
     sim, res = run_sim(cfg, algo, "visiting_hours", intensity=intensity)
     assert max(t["load"] for t in res.timeline) <= cfg.capacity
+
+
+def test_patient_transfer_group_boards_together(cfg):
+    cfg.capacity = 4
+    pax = [Passenger(0, 1, 9, 0.0, is_emergency=True, clinical_alert=True, space_units=3),
+           Passenger(1, 1, 6, 0.0, space_units=2)]
+    sim = ElevatorSimulator(cfg, pax, AIDispatcher(DEFAULT_WEIGHTS))
+    result = sim.run()
+    assert result.n_served == 2
+    assert all(t["load"] <= cfg.capacity for t in result.timeline)
+    assert pax[0].board_time is not None and pax[0].exit_time is not None
 
 
 @pytest.mark.parametrize("algo", ALGORITHMS)
@@ -133,16 +205,19 @@ def test_everyone_served_and_times_ordered(cfg, algo, scenario):
 
 
 @pytest.mark.parametrize("building", list(PRESETS))
-def test_works_on_every_building(building):
+def test_works_on_every_hospital(building):
     cfg = PRESETS[building]()
-    for sc in ("up_peak", "down_peak", "mixed"):
+    for sc in SCENARIOS:
         r = run_once(cfg, sc, "EleWaiter AI", seed=2, duration=200)
         assert r.n_served == r.n_total
 
 
-def test_disabled_lift_never_moves(cfg):
+def test_failed_lift_retires_after_delivering_onboard_passengers(cfg):
     sim, res = run_sim(cfg, "EleWaiter AI", "lift_failure")
-    assert sim.lifts[0].travelled == 0 and sim.lifts[0].state == LiftState.OUT_OF_SERVICE
+    assert sim.lifts[0].travelled > 0
+    assert sim.lifts[0].retiring and sim.lifts[0].state == LiftState.OUT_OF_SERVICE
+    assert not sim.lifts[0].passengers and not sim.lifts[0].assigned
+    assert res.n_served == res.n_total
 
 
 def test_deterministic(cfg):
@@ -435,18 +510,31 @@ class TestMetrics:
         assert 0.0 <= r.em_within_target <= 1.0
 
     def test_inference_precision_recall_are_reported_and_imperfect(self, cfg):
-        r = run_once(cfg, "emergency_surge", "Nearest", 4, 900)
+        # Exercise the floor-only fallback explicitly; normal runs report every emergency.
+        r = run_once(cfg, "emergency_surge", "Nearest", 4, 900, alert_coverage=0.0)
         assert 0 < r.infer_recall < 1.0       # code responses on wards are missed by context rules
         assert 0 < r.infer_precision <= 1.0
 
-    def test_no_emergency_metrics_in_office(self):
-        r = run_once(office_12(), "mixed", "Nearest", 2, 200)
+    def test_every_emergency_is_reported_by_default(self, cfg):
+        r = run_once(cfg, "emergency_surge", "EleWaiter AI", 4, 300)
+        assert r.n_emergency > 0
+        assert r.n_clinical_alerts == r.n_emergency
+
+    def test_no_emergency_metrics_with_zero_rate(self, cfg):
+        r = run_once(cfg, "emergency_surge", "Nearest", 2, 200, emergency_rate=0.0)
         assert r.n_emergency == 0 and r.em_avg_wait is None
 
 
 # ------------------------------------------------------------------ optimizer
 class TestOptimizer:
     FK = dict(scenarios=("emergency_surge",), seeds=(1,), intensities=(1.0,), duration=150.0)
+
+    def test_full_emergency_trip_affects_training_score(self):
+        fast = SimulationResult(n_total=1, n_served=1, n_emergency=1,
+                                em_avg_journey=20, em_p95_journey=20)
+        slow = SimulationResult(n_total=1, n_served=1, n_emergency=1,
+                                em_avg_journey=40, em_p95_journey=40)
+        assert composite(fast) < composite(slow)
 
     def test_fitness_deterministic(self, cfg):
         assert fitness(DEFAULT_WEIGHTS, cfg, **self.FK) == fitness(DEFAULT_WEIGHTS, cfg, **self.FK)

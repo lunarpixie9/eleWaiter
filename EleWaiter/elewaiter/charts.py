@@ -13,12 +13,14 @@ def comparison_bar(df: pd.DataFrame, metric: str, title: str, ylabel: str = "sec
     return fig
 
 
-def wait_histogram(results, em: bool = False):
+def wait_histogram(results, em: bool = False, labels: dict[str, str] | None = None):
     fig = go.Figure()
+    labels = labels or {}
     for r in results:
         vals = r.em_wait_times if em else r.wait_times
         if vals:
-            fig.add_trace(go.Histogram(x=vals, name=r.algorithm, opacity=0.6, xbins=dict(size=2)))
+            fig.add_trace(go.Histogram(x=vals, name=labels.get(r.algorithm, r.algorithm),
+                                       opacity=0.6, xbins=dict(size=2)))
     fig.update_layout(barmode="overlay", height=340, xaxis_title="waiting time (s)",
                       yaxis_title="passengers", title="Emergency passenger waits" if em else "Waiting-time distribution")
     return fig

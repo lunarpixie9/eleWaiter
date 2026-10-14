@@ -1,5 +1,4 @@
 """EleWaiter - Streamlit UI.   Run:  streamlit run ui/app.py"""
-import json
 import os
 import sys
 
@@ -10,138 +9,255 @@ import pandas as pd
 import streamlit as st
 
 from elewaiter import charts
-from elewaiter.benchmark import ALGORITHMS, CORE_ALGORITHMS, run_once
-from elewaiter.buildings import PRESETS
+from elewaiter.benchmark import ALGORITHMS, run_once
+from elewaiter.buildings import custom_hospital
 from elewaiter.dispatchers import DEFAULT_WEIGHTS, load_tuned_weights
 from elewaiter.metrics import EMERGENCY_WAIT_TARGET
-from elewaiter.models import Urgency
 from elewaiter.optimizer import genetic_algorithm
-from elewaiter.traffic import HOSPITAL_SCENARIOS, GENERAL_SCENARIOS, SCENARIOS
+from elewaiter.traffic import BASE_RATE_PER_LIFT, SCENARIOS
 
-st.set_page_config(page_title="EleWaiter", page_icon="🛗", layout="wide")
+DISPLAY_NAMES = {
+    "EleWaiter AI": "EleWaiter AI (A* planner)",
+    "AI (no emergency logic)": "AI without emergency rules (A* planner)",
+}
+
+
+def display_method(name):
+    return DISPLAY_NAMES.get(name, name)
+
+st.set_page_config(page_title="EleWaiter", page_icon="🛗", layout="wide",
+                   initial_sidebar_state="expanded")
 st.title("🛗 EleWaiter")
-st.caption("Emergency-first intelligent lift dispatch & fairness simulator - hospital focus, works for any building.")
+st.caption("Simulate hospital lift decisions and check emergency waiting times.")
+st.info("Choose a situation on the left, then press **Run simulation**. "
+        "This is a simulation, not a live lift control system.")
+with st.expander("Which algorithms are included, and which are needed?"):
+    st.markdown(r"""
+**Used automatically for hospital dispatch:** **EleWaiter AI (A\* planner)** combines urgency rules,
+predicted lift space, a wait/travel/fairness cost score, A\* assignment of several waiting calls,
+reassignment as conditions change, an emergency lane, and a guard against very long waits.
+Lifts serve planned stops using LOOK-style direction control.
+
+**Use for comparison:** FCFS, Nearest, Collective (LOOK-ETA), and Priority-Nearest show how
+simpler methods perform on the same trips. **AI without emergency rules** tests the value of
+the emergency features. These are useful for evaluation, but are not required to dispatch calls.
+
+**Optional tuning:** Genetic Algorithm (GA) and Simulated Annealing (SA) can tune the AI's
+cost weights before a run. Neither is required to use the app or runs on every lift call.
+
+**Where is A\*?** It is inside EleWaiter AI, not a separate method to select. Its search is
+bounded; the AI falls back to a simpler assignment if the search limit is reached.
+""")
 
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
-    st.header("Setup")
-    bname = st.selectbox("Building", list(PRESETS))
-    cfg = PRESETS[bname]()
-    pool = HOSPITAL_SCENARIOS + GENERAL_SCENARIOS if cfg.kind == "hospital" else GENERAL_SCENARIOS
-    scenario = st.selectbox("Scenario", pool, format_func=lambda k: SCENARIOS[k].label)
-    st.caption(SCENARIOS[scenario].description)
-    intensity = st.slider("Routine traffic intensity", 0.5, 2.5, 1.5, 0.1)
-    has_crit = bool(cfg.critical_floors())
-    use_default_em = st.checkbox("Scenario's default emergency rate", True, disabled=not has_crit)
-    em_rate = None
-    if has_crit and not use_default_em:
-        em_rate = st.slider("Emergencies per minute", 0.0, 6.0, 1.0, 0.1) / 60.0
-    duration = st.slider("Simulated seconds", 200, 900, 600, 50)
-    seed = st.number_input("Random seed", 0, 99999, 2000)
-    algos = st.multiselect("Dispatchers", ALGORITHMS, default=CORE_ALGORITHMS)
-    run = st.button("Run simulation", type="primary", width="stretch")
+    st.header("Set up your hospital")
+    situation = st.radio("Hospital situation",
+                         ["Normal traffic (no emergency)", "With emergency"], index=1)
+    st.caption("Normal traffic has staff and visitor trips. With emergency adds urgent lift trips.")
 
-if run or "results" not in st.session_state:
+    num_floors = int(st.number_input("Number of floors", min_value=3, max_value=30, value=10))
+    num_lifts = int(st.number_input("Number of lifts", min_value=1, max_value=20, value=3))
+    capacity = int(st.number_input("Max capacity per lift (spaces)", min_value=3,
+                                   max_value=40, value=12,
+                                   help="One space is one unit of lift capacity. An ordinary rider uses 1; a stretcher with staff uses 3 spaces total by default."))
+    floor_options = list(range(2, num_floors + 1))
+    er_floor = st.selectbox("Emergency room (ER) floor", floor_options, index=floor_options.index(2))
+    icu_floor = st.selectbox("ICU floor", floor_options, index=floor_options.index(max(3, num_floors - 1)))
+    ot_floor = st.selectbox("Operating theatre floor", floor_options, index=floor_options.index(num_floors))
+    imaging_floor = st.selectbox("Imaging / labs floor", floor_options, index=floor_options.index(3))
+    st.caption("Floor 1 is the lobby. Departments can share a floor; use at least two clinical floors for lift transfers.")
+
+    transfer_space = 3
+    if situation == "With emergency":
+        transfer = st.selectbox("Emergency transfer load",
+                                ["Stretcher + staff (3 spaces)", "Stretcher + team (5 spaces)",
+                                 "Staff response only (1 space)"],
+                                help="The patient, stretcher and staff must fit in one lift.")
+        transfer_space = {"Stretcher + staff (3 spaces)": 3,
+                          "Stretcher + team (5 spaces)": 5,
+                          "Staff response only (1 space)": 1}[transfer]
+        st.caption("Every emergency trip is reported as urgent and requires a lift.")
+        st.caption("The stretcher has no separate size setting: 3 or 5 spaces cover the whole patient, stretcher and staff group.")
+
+    layout = (num_floors, num_lifts, capacity, er_floor, icu_floor, ot_floor, imaging_floor)
+    problem = None
+    try:
+        cfg = custom_hospital(*layout)
+    except ValueError as exc:
+        cfg, problem = None, str(exc)
+    if transfer_space > capacity:
+        problem = "The selected stretcher/team needs more spaces than this lift can hold."
+    if problem:
+        st.error(problem)
+
+    with st.expander("Optional test settings"):
+        length = st.selectbox("How long should the test run?", ["5 minutes", "3 minutes", "10 minutes"])
+        duration = {"3 minutes": 180, "5 minutes": 300, "10 minutes": 600}[length]
+        seed = st.number_input("Repeatable trip pattern", 0, 99999, 2000)
+        compare = st.checkbox("Compare with other methods", value=False)
+        defaults = ["EleWaiter AI", "Collective (LOOK-ETA)", "Priority-Nearest"]
+        algos = ["EleWaiter AI"]
+        if compare:
+            comparison = st.selectbox("Which methods should we compare?",
+                                      ["AI vs common methods", "All methods", "Choose methods"])
+            algos = {"AI vs common methods": defaults, "All methods": ALGORITHMS}.get(comparison)
+            if algos is None:
+                algos = st.multiselect("Lift methods", ALGORITHMS, default=defaults,
+                                       format_func=display_method)
+    st.caption("Lift method: EleWaiter AI (includes A*).")
+    run = st.button("Run simulation", type="primary", width="stretch", disabled=bool(problem))
+
+if run:
     with st.spinner("Simulating..."):
-        st.session_state["results"] = [run_once(cfg, scenario, a, int(seed), float(duration), float(intensity),
-                                                None, em_rate) for a in (algos or CORE_ALGORITHMS)]
-        st.session_state["meta"] = (bname, scenario)
+        emergency_rate = 0.0 if situation == "Normal traffic (no emergency)" else None
+        st.session_state["results"] = [run_once(cfg, "emergency_surge", a, int(seed), float(duration), 1.0,
+                                                emergency_rate=emergency_rate, alert_coverage=1.0,
+                                                transfer_space=transfer_space) for a in (algos or ["EleWaiter AI"])]
+        st.session_state["meta"] = (situation, layout, transfer_space, duration, seed, tuple(algos))
+        st.session_state["result_cfg"] = cfg
+if problem:
+    st.stop()
+if "results" not in st.session_state or "result_cfg" not in st.session_state:
+    st.stop()
 results = st.session_state["results"]
+saved = st.session_state["meta"]
+if saved != (situation, layout, transfer_space, duration, seed, tuple(algos)):
+    st.warning("Settings changed. Press **Run simulation** to update the results below.")
+result_cfg = st.session_state["result_cfg"]
 df = pd.DataFrame([r.row() for r in results])
+df["algorithm"] = df["algorithm"].map(display_method)
 
-tabs = st.tabs(["Results", "Emergency focus", "Lift activity", "Optimizer", "Building & urgency rules", "About"])
+overview_tab, = st.tabs(["Overview"])
 
-# ------------------------------------------------------------------ results
-with tabs[0]:
-    st.caption(f"{st.session_state['meta'][0]} | {SCENARIOS[st.session_state['meta'][1]].label} | one seed - use run_benchmark.py for multi-seed statistics")
-    cols = ["algorithm", "avg_wait", "p95_wait", "max_wait", "wait_std", "starvation_count",
-            "left_behind", "travel_distance", "avg_journey"]
-    st.dataframe(df[cols].round(2), hide_index=True, width="stretch")
-    c1, c2 = st.columns(2)
-    c1.plotly_chart(charts.comparison_bar(df, "avg_wait", "Average wait"), width="stretch")
-    c2.plotly_chart(charts.comparison_bar(df, "p95_wait", "95th-percentile wait (fairness tail)"), width="stretch")
-    c3, c4 = st.columns(2)
-    c3.plotly_chart(charts.comparison_bar(df, "starvation_count", "Passengers waiting 45 s or more", "passengers"), width="stretch")
-    c4.plotly_chart(charts.comparison_bar(df, "left_behind", "Left behind by a full lift", "events"), width="stretch")
-    st.plotly_chart(charts.wait_histogram(results), width="stretch")
 
-# ------------------------------------------------------------------ emergency
-with tabs[1]:
-    if df["n_emergency"].max() == 0:
-        st.info("This building/scenario has no emergencies (no critical floors, or the rate is zero).")
+def seconds(value):
+    return "—" if value is None else f"{value:.1f} s"
+
+
+with overview_tab:
+    selected = "EleWaiter AI" if any(r.algorithm == "EleWaiter AI" for r in results) else results[0].algorithm
+    if len(results) > 1:
+        selected = st.selectbox("Show results for", [r.algorithm for r in results],
+                                index=[r.algorithm for r in results].index(selected),
+                                format_func=display_method)
+    res = next(r for r in results if r.algorithm == selected)
+    st.caption(f"{saved[0]} · {result_cfg.num_floors} floors · {result_cfg.num_lifts} lifts · "
+               f"{result_cfg.capacity} spaces per lift · {saved[3] / 60:g}-minute arrival period")
+    st.write("**What happened in this run**")
+    st.write(f"{display_method(selected)} completed **{res.n_served} of {res.n_total} lift trips**. "
+             + (f"The average wait to board was **{res.avg_wait:.1f} seconds**. " if res.n_served else "")
+             + f"**{res.n_emergency}** requests were emergencies.")
+    ordinary_rate = BASE_RATE_PER_LIFT * SCENARIOS["emergency_surge"].rate_factor
+    emergency_rate = (SCENARIOS["emergency_surge"].emergency_rate
+                      if saved[0] == "With emergency" else 0.0)
+    expected_trips = (ordinary_rate * result_cfg.num_lifts + emergency_rate) * saved[3]
+    st.caption(f"Total trips = ordinary requests ({res.n_total - res.n_emergency}) + "
+               f"emergency requests ({res.n_emergency}) = {res.n_total}. "
+               f"Expected total ≈ ({ordinary_rate:.2f} ordinary requests/second/lift × "
+               f"{result_cfg.num_lifts} lifts + {emergency_rate:.3f} emergency requests/second) "
+               f"× {saved[3]:g} seconds = {expected_trips:.1f}. "
+               "The actual count varies because arrivals are random. One patient with their team "
+               "counts as one trip; completed means they reached their destination.")
+    a, b, c, d = st.columns(4)
+    a.metric("Trips completed", f"{res.n_served}/{res.n_total}")
+    b.metric("Trips not completed", res.n_unserved,
+             help="Still waiting or travelling when the simulation ended.")
+    c.metric("Average wait to board", seconds(res.avg_wait if res.n_served else None))
+    d.metric("95% waited within (P95)", seconds(res.p95_wait if res.n_served else None),
+             help="The 95th percentile: about 95% of completed trips had a wait at or below this value.")
+    if res.n_unserved:
+        st.warning(f"{res.n_unserved} trips were not completed. The wait and journey times below describe completed trips only.")
     else:
-        st.write(f"**{int(df['n_emergency'].max())} emergency trips** in this run. Emergency status is ground truth that dispatchers "
-                 f"never see - they must infer it from floors and time. Target: board within {EMERGENCY_WAIT_TARGET:.0f} s.")
-        ecols = ["algorithm", "em_avg_wait", "em_p95_wait", "em_max_wait", "em_within_target", "routine_avg_wait"]
-        st.dataframe(df[ecols].round(2), hide_index=True, width="stretch")
-        c1, c2 = st.columns(2)
-        c1.plotly_chart(charts.comparison_bar(df, "em_avg_wait", "Emergency average wait"), width="stretch")
-        c2.plotly_chart(charts.comparison_bar(df, "routine_avg_wait", "Routine passengers' average wait (the cost of priority)"), width="stretch")
-        st.plotly_chart(charts.wait_histogram(results, em=True), width="stretch")
-        p, r = df["infer_precision"].dropna(), df["infer_recall"].dropna()
-        if len(p) and len(r):
-            st.write(f"**Context inference quality (this run):** precision {p.iloc[0]:.0%} (inferred-critical trips that were real "
-                     f"emergencies), recall {r.iloc[0]:.0%} (real emergencies the floor rules recognised). Code responses on "
-                     f"ordinary wards cannot be recognised from floors alone - a known limitation.")
+        st.success("Every requested trip reached its destination.")
 
-# ------------------------------------------------------------------ activity
-with tabs[2]:
-    pick = st.selectbox("Dispatcher", [r.algorithm for r in results])
-    res = next(r for r in results if r.algorithm == pick)
+    st.write("**Emergency response**")
+    if res.n_emergency:
+        completed_em = len(res.em_wait_times)
+        st.write(f"**{completed_em} of {res.n_emergency} emergency trips completed.** "
+                 "All emergency requests were reported as urgent.")
+        a, b, c, d = st.columns(4)
+        a.metric("Emergency wait to board", seconds(res.em_avg_wait))
+        b.metric("Call → destination", seconds(res.em_avg_journey))
+        c.metric(f"Boarded within {EMERGENCY_WAIT_TARGET:.0f} s",
+                 "—" if res.em_within_target is None else f"{res.em_within_target:.0%}")
+        d.metric("Ordinary trip wait", seconds(res.routine_avg_wait))
+        st.caption(f"Wait = request to boarding. Full trip = request to arrival at the destination. "
+                   f"The {EMERGENCY_WAIT_TARGET:.0f}-second pickup target is a simulation setting. "
+                   "Emergency times and target percentage use completed emergency trips only. "
+                   "Ordinary wait uses completed non-emergency trips.")
+        if completed_em < res.n_emergency:
+            st.warning(f"{res.n_emergency - completed_em} emergency trips did not finish; they are not included in the averages or target percentage.")
+    else:
+        st.info("Normal traffic mode: no emergency trips were generated.")
+
+    st.write("**Long waits and full lifts**")
+    a, b, c = st.columns(3)
+    a.metric("Longest wait", seconds(res.max_wait if res.n_served else None))
+    b.metric("Waits of 45 s or more", res.starvation_count,
+             help="Completed trips that waited at least 45 seconds to board.")
+    c.metric("Full-lift pass-bys", res.left_behind,
+             help="Times a lift could not pick someone up because it lacked space. One request may be passed more than once.")
+    st.caption("Smaller waits are better. Full-lift pass-bys are events, not a count of different people.")
+
+    if len(results) > 1:
+        with st.expander("Compare all selected lift methods", expanded=True):
+            fields = ["algorithm", "n_served", "n_unserved", "avg_wait", "em_avg_wait", "em_avg_journey"]
+            st.dataframe(df[fields].rename(columns={
+                "algorithm": "Lift method", "n_served": "Trips completed", "n_unserved": "Not completed",
+                "avg_wait": "Average wait (s)", "em_avg_wait": "Emergency wait (s)",
+                "em_avg_journey": "Emergency full trip (s)"}).round(1), hide_index=True, width="stretch")
+            st.caption("Each method receives the same trip requests. This table compares independent simulation runs.")
+
+    st.write("**How the lifts moved**")
+    st.caption("Read left to right through time. Each dot is a lift opening its doors on a floor. "
+               "Colours identify lifts; marker shapes distinguish emergency-lane stops. Larger dots mean more capacity spaces occupied.")
     st.plotly_chart(charts.lift_activity(res.timeline), width="stretch")
-    st.caption("Each dot is a door opening; size = passengers aboard; diamonds/other symbols mark emergency-lane trips.")
 
-# ------------------------------------------------------------------ optimizer
-with tabs[3]:
-    tuned = load_tuned_weights()
-    st.write("The AI dispatcher's cost-function weights are tuned with a Genetic Algorithm (or Simulated Annealing via "
-             "`train_optimizer.py`), using the simulator itself as the fitness function.")
-    wdf = pd.DataFrame({"default": DEFAULT_WEIGHTS, "tuned (shipped)": tuned or DEFAULT_WEIGHTS}).round(3)
-    st.dataframe(wdf, width="stretch")
-    log = os.path.join(ROOT, "elewaiter", "data", "training_log.json")
-    if os.path.exists(log):
-        L = json.load(open(log))
-        st.plotly_chart(charts.training_curve({"GA": L["ga_history"], "SA": L["sa_history"]}), width="stretch")
-        st.caption(f"Validation fitness (different seeds): { {k: round(v, 1) for k, v in L['validation'].items()} } - winner: {L['winner']}")
-    with st.expander("Run a quick GA here (small; the shipped weights used a bigger run)"):
-        if st.button("Run mini-GA"):
-            bar = st.progress(0.0)
-            best, hist = genetic_algorithm(cfg, pop_size=8, generations=4,
-                                           fit_kwargs=dict(scenarios=("emergency_surge",), seeds=(1000, 1001), intensities=(1.5,), duration=200.0),
-                                           progress=lambda g, f: bar.progress(g / 4))
-            st.plotly_chart(charts.training_curve({"GA": hist}), width="stretch")
-            st.dataframe(pd.DataFrame({"default": DEFAULT_WEIGHTS, "mini-GA best": best}).round(3), width="stretch")
+    with st.expander("Hospital layout used in this run"):
+        st.write(f"**{result_cfg.num_lifts} lifts**, each with **{result_cfg.capacity} spaces**. "
+                 f"Patient-transfer groups reserve **{saved[2]} spaces** when emergency trips are enabled.")
+        st.caption("One space = one unit of lift capacity. An ordinary rider uses 1 space. "
+                   "The default stretcher + staff transfer uses 3 spaces total; a larger team uses 5. "
+                   "These are simulation assumptions, not physical measurements of a stretcher.")
+        st.dataframe(pd.DataFrame([{"Floor": f.number, "Department": f.name}
+                                  for f in result_cfg.floors.values()]), hide_index=True, width="stretch")
 
-# ------------------------------------------------------------------ building
-with tabs[4]:
-    st.subheader(cfg.name)
-    st.dataframe(pd.DataFrame([{"floor": f.number, "name": f.name, "zone": f.zone.name, "role": f.role,
-                                "time boost": ", ".join(f"{a:.0f}-{b:.0f}s" for a, b in f.boost_windows) or "-"}
-                               for f in cfg.floors.values()]), hide_index=True, width="stretch")
-    st.write("**Urgency rules (no buttons, cards or extra hardware):** a trip from a CRITICAL zone (ER/ICU/OT) to a HIGH or "
-             "CRITICAL zone is *critical*; any other trip touching a HIGH/CRITICAL zone is *elevated*; the rest are routine. "
-             "Zones can be upgraded during time windows (e.g. lecture floors just before class). "
-             "On top of that, urgency rises automatically with waiting time.")
-    a, b, t = st.columns(3)
-    o = a.selectbox("From", sorted(cfg.floors), format_func=lambda n: f"{n} - {cfg.floors[n].name}")
-    d = b.selectbox("To", sorted(cfg.floors), index=min(1, len(cfg.floors) - 1), format_func=lambda n: f"{n} - {cfg.floors[n].name}")
-    tt = t.number_input("At time (s)", 0, 3600, 0)
-    st.metric("Inferred urgency", Urgency(cfg.infer_urgency(o, d, float(tt))).name if o != d else "choose different floors")
+    with st.expander("How the AI chooses a lift — in simple terms"):
+        st.markdown(r"""
+1. **Check each lift:** estimate pickup time, travel time and available space.
+2. **Score the choices (cost heuristic):** weigh urgency, waiting, crowding and delays to other trips.
+3. **Plan several calls together (A\*):** search combinations of lift assignments within a limited search budget.
+4. **Update the plan:** revise assignments as lifts move; use an emergency lane when the cost model favours direct service.
+5. **Prevent long waits:** raise waiting passengers' priority and apply a starvation guard.
 
-# ------------------------------------------------------------------ about
-with tabs[5]:
-    st.markdown("""
-**What it is.** A simulator plus an AI dispatcher that decides which lift serves which passenger, built for hospitals
-where an emergency transfer (ER to ICU/OT) must not wait behind routine traffic, while visitors and staff are not starved.
-
-**AI components**
-- Multi-objective cost: own wait/ride (scaled by urgency), delay imposed on others, crowding, predicted overflow.
-- A* search over joint assignments of pending calls; dynamic re-optimisation of not-yet-boarded passengers.
-- Emergency lane: critical trips get a lift committed to them (batching several critical passengers), chosen by cost
-  versus normal priority service so a burst cannot stall the whole building.
-- Anti-starvation: priority grows with waiting time; left-behind passengers get a boost; a hard guard force-assigns.
-- GA / simulated annealing tune the weights.
-
-**Honest limits.** Results hold for the simulated traffic, not real buildings. Urgency is inferred from context, so some
-real emergencies are missed and some routine trips are boosted (measured above).
+The movement chart shows the resulting stops. It does not display a recorded explanation of every individual assignment.
 """)
+
+    with st.expander("Technical details and waiting-time chart"):
+        st.caption("P95 is the 95th percentile; it describes longer waits, not just the average. All timing statistics here use completed trips.")
+        st.dataframe(pd.DataFrame([{
+            "Average full trip (s)": res.avg_journey if res.n_served else None,
+            "Wait variation — standard deviation (s)": res.wait_std if res.n_served else None,
+            "Emergency P95 wait (s)": res.em_p95_wait,
+            "Emergency P95 full trip (s)": res.em_p95_journey,
+            "Lift floors travelled": res.travel_distance,
+            "Starvation-guard assignments": res.forced_assignments,
+        }]).round(1), hide_index=True, width="stretch")
+        st.plotly_chart(charts.wait_histogram([res], labels=DISPLAY_NAMES), width="stretch")
+
+    with st.expander("Advanced: tune the AI weights (optional)"):
+        tuned = load_tuned_weights(result_cfg.name)
+        st.write("Weights control how strongly the AI values waiting time, travel, space and fairness. "
+                 "GA and simulated annealing can tune them before a simulation; they do not run for each lift call.")
+        st.dataframe(pd.DataFrame({"Default": DEFAULT_WEIGHTS, "Used in this run": tuned or DEFAULT_WEIGHTS}).round(3), width="stretch")
+        if st.button("Try a small GA (does not save weights)"):
+            bar = st.progress(0.0)
+            best, hist = genetic_algorithm(result_cfg, pop_size=8, generations=4,
+                fit_kwargs=dict(scenarios=("emergency_surge",), seeds=(1000, 1001), intensities=(1.5,),
+                                duration=200.0, transfer_space=saved[2]),
+                progress=lambda g, f: bar.progress(g / 4))
+            st.plotly_chart(charts.training_curve({"GA": hist}), width="stretch")
+            st.dataframe(pd.DataFrame({"Default": DEFAULT_WEIGHTS, "Example tuned weights": best}).round(3), width="stretch")
+
+    st.caption("Results describe this simulated hospital and trip pattern. Try several trip patterns before judging a method's performance.")

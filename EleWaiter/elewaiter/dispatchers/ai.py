@@ -51,12 +51,19 @@ WEIGHT_BOUNDS: Dict[str, Tuple[float, float]] = {
     "w_backlog": (0.0, 2.0), "w_protect": (0.0, 1.0),
 }
 
-_TUNED_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "tuned_weights.json")
+_TUNED_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "tuned_weights_hospital_v2_10.json")
+_TUNED_15_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "tuned_weights_hospital_v2_15.json")
 
 
-def load_tuned_weights() -> Optional[Dict[str, float]]:
+def load_tuned_weights(building: str = "10-floor Hospital") -> Optional[Dict[str, float]]:
+    if building == "10-floor Hospital":
+        path = _TUNED_PATH
+    elif building == "15-floor Hospital":
+        path = _TUNED_15_PATH
+    else:
+        return None
     try:
-        with open(_TUNED_PATH) as fh:
+        with open(path) as fh:
             w = json.load(fh)
         return {**DEFAULT_WEIGHTS, **{k: float(v) for k, v in w.items() if k in DEFAULT_WEIGHTS}}
     except (OSError, ValueError):
@@ -105,19 +112,20 @@ class AIDispatcher(Dispatcher):
             return None
         critical = self._is_express(p)
         if m.express:                                   # lane already running
-            if not critical or m.onboard >= m.cap:
+            if not critical or m.onboard + p.space_units > m.cap:
                 return None
-            c = normal_cost(m, p.origin, p.destination, W, self.w)
-            return c, m.with_pickup(p.origin, p.destination), True
+            c = normal_cost(m, p.origin, p.destination, W, self.w, p.space_units)
+            return c, m.with_pickup(p.origin, p.destination, p.space_units), True
         best = None
-        if critical and m.onboard < m.cap:
-            c = self.w["x_express"] * express_cost(m, p.origin, p.destination, W, self.w, self._bpl)
-            best = (c, m.as_express(), True)
-        c = normal_cost(m, p.origin, p.destination, W, self.w)
+        if critical and m.onboard + p.space_units <= m.cap:
+            c = self.w["x_express"] * express_cost(m, p.origin, p.destination, W, self.w,
+                                                    self._bpl, p.space_units)
+            best = (c, m.as_express().with_pickup(p.origin, p.destination, p.space_units), True)
+        c = normal_cost(m, p.origin, p.destination, W, self.w, p.space_units)
         if p.assigned_lift is not None and p.assigned_lift != m.id:
             c += self.w["w_switch"]
         if best is None or c < best[0]:
-            best = (c, m.with_pickup(p.origin, p.destination), False)
+            best = (c, m.with_pickup(p.origin, p.destination, p.space_units), False)
         return best
 
     # ------------------------------------------------------------------ search
@@ -185,7 +193,8 @@ class AIDispatcher(Dispatcher):
     # ------------------------------------------------------------------ API
     def assign(self, unassigned, reassignable, lifts, now, config) -> Assignment:
         out = Assignment()
-        active = max(1, sum(1 for l in lifts if l.state != LiftState.OUT_OF_SERVICE))
+        active = max(1, sum(1 for l in lifts if l.state != LiftState.OUT_OF_SERVICE
+                            and not l.retiring))
         self._bpl = (len(unassigned) + sum(len(l.assigned) for l in lifts)) / active
         un = sorted(unassigned, key=lambda p: (-self.pweight(p, now), p.arrival_time))
         re = sorted(reassignable, key=lambda p: (-self.pweight(p, now), p.arrival_time))

@@ -1,0 +1,17 @@
+# Local Python environment
+EleWaiter/.venv/
+
+# Python and test caches
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/
+
+# Generated presentation files
+EleWaiter/.pptx-build/
+EleWaiter/.codex-finalizer/
+EleWaiter/output/
+*.pptx
+
+# Generated benchmark and optimizer output
+EleWaiter/results*.csv
+EleWaiter/elewaiter/data/training_log*.json

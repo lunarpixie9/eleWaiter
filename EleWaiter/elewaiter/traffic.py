@@ -1,8 +1,7 @@
-"""Passenger traffic: Poisson arrivals + scenario-specific flows.
+"""Hospital passenger traffic with Poisson arrivals and scenario-specific flows.
 
-Hospital scenarios are the focus; `up_peak`, `down_peak` and `mixed` work on any
-building. Emergencies are *ground truth* (Passenger.is_emergency). The dispatcher
-never reads that flag - it must infer urgency from floor/zone context.
+Emergencies are ground truth (Passenger.is_emergency). By default, every
+emergency receives a simulated clinical alert visible to the dispatcher.
 """
 from __future__ import annotations
 
@@ -21,46 +20,38 @@ class ScenarioSpec:
     key: str
     label: str
     description: str
-    hospital: bool = False          # hospital-oriented flows
     disabled_lifts: Tuple[int, ...] = ()
+    failure_at: Optional[float] = None
+    failure_lifts: Tuple[int, ...] = ()
     rate_factor: float = 1.0
-    emergency_rate: float = 0.0     # emergencies / second (only if building has critical floors)
+    emergency_rate: float = 0.0     # emergencies / second
 
 
 SCENARIOS: Dict[str, ScenarioSpec] = {s.key: s for s in [
     ScenarioSpec("emergency_surge", "Emergency surge",
                  "Normal hospital traffic plus a steady stream of ER -> ICU/OT/imaging patient transfers "
-                 "and occasional code-response trips.", True, rate_factor=1.0, emergency_rate=0.012),
+                 "and occasional code-response trips.", rate_factor=1.0, emergency_rate=0.012),
     ScenarioSpec("mass_casualty", "Mass-casualty event",
                  "Moderate traffic, then 14 emergency transfers and code responses arrive within about a minute.",
-                 True, rate_factor=0.9, emergency_rate=0.004),
+                 rate_factor=0.9, emergency_rate=0.004),
     ScenarioSpec("visiting_hours", "Visiting hours",
                  "Heavy lobby -> ward visitor flow (the 'up-peak' of a hospital) with sporadic emergencies.",
-                 True, rate_factor=1.3, emergency_rate=0.005),
+                 rate_factor=1.3, emergency_rate=0.005),
     ScenarioSpec("shift_change", "Shift change",
                  "Staff flowing between lobby and all floors in both directions, with sporadic emergencies.",
-                 True, rate_factor=1.2, emergency_rate=0.005),
-    ScenarioSpec("lift_failure", "Lift failure",
-                 "Emergency-surge traffic while one lift is out of service.",
-                 True, disabled_lifts=(0,), rate_factor=1.0, emergency_rate=0.010),
-    ScenarioSpec("up_peak", "Up-peak (general)",
-                 "Morning rush: most trips start at the lobby. Works on any building.",
-                 False, rate_factor=1.5, emergency_rate=0.004),
-    ScenarioSpec("down_peak", "Down-peak (general)",
-                 "Evening exit: most trips end at the lobby. Works on any building.",
-                 False, rate_factor=1.4, emergency_rate=0.004),
-    ScenarioSpec("mixed", "Mixed inter-floor (general)",
-                 "Random trips between all floors. Works on any building.",
-                 False, rate_factor=1.0, emergency_rate=0.004),
+                 rate_factor=1.2, emergency_rate=0.005),
+    ScenarioSpec("lift_failure", "Lift removed from service",
+                 "Emergency-surge traffic; one lift stops accepting calls at 120 s and delivers anyone already aboard.",
+                 failure_at=120.0, failure_lifts=(0,), rate_factor=1.0, emergency_rate=0.010),
 ]}
 
-HOSPITAL_SCENARIOS = [k for k, s in SCENARIOS.items() if s.hospital]
-GENERAL_SCENARIOS = [k for k, s in SCENARIOS.items() if not s.hospital]
+HOSPITAL_SCENARIOS = list(SCENARIOS)
 
 
 class TrafficGenerator:
     def __init__(self, config: BuildingConfig, seed: int = 42):
         self.cfg = config
+        self.seed = seed
         self.rng = np.random.default_rng(seed)
         self.lobby = config.lobby
         self.all_floors = list(range(1, config.num_floors + 1))
@@ -94,10 +85,6 @@ class TrafficGenerator:
     def _lobby_down(self):
         return self._pick(self.upper), self.lobby
 
-    def _inter(self):
-        o = self._pick(self.all_floors)
-        return o, self._pair_other_than(o, self.all_floors)
-
     def _staff(self):
         o = self._pick(self.upper)
         return o, self._pair_other_than(o, self.upper)
@@ -130,6 +117,9 @@ class TrafficGenerator:
     def _post_op(self):
         """Patient moved from the OT to ICU."""
         ot, icu = self._role("ot"), self._role("icu")
+        if not any(origin != destination for origin in ot for destination in icu):
+            # A shared OT/ICU floor has no lift transfer; generate an ER transfer instead.
+            return self._er_transfer()
         o = self._pick(ot)
         return o, self._pair_other_than(o, icu)
 
@@ -148,18 +138,20 @@ class TrafficGenerator:
         for t in self._times(rate, duration):
             fn = mix[int(self.rng.choice(len(mix), p=weights))][1]
             o, d = fn()
-            events.append((t, o, d, False))
+            events.append((t, o, d, False, False))
         return events
 
     def _emergencies(self, rate: float, duration: float):
         if rate <= 0 or not self.cfg.critical_floors():
             return []
         events = []
-        kinds = [(0.55, self._er_transfer), (0.2, self._post_op), (0.25, self._code_response)]
+        kinds = [(0.55, self._er_transfer, True), (0.2, self._post_op, True),
+                 (0.25, self._code_response, False)]
         w = np.array([k[0] for k in kinds]); w /= w.sum()
         for t in self._times(rate, duration):
-            o, d = kinds[int(self.rng.choice(len(kinds), p=w))][1]()
-            events.append((t, o, d, True))
+            _, fn, transfer = kinds[int(self.rng.choice(len(kinds), p=w))]
+            o, d = fn()
+            events.append((t, o, d, True, transfer))
         return events
 
     def _burst(self, start: float, span: float, n_transfers: int, n_codes: int, duration: float):
@@ -168,14 +160,19 @@ class TrafficGenerator:
         events = []
         for _ in range(n_transfers):
             o, d = self._er_transfer()
-            events.append((start + float(self.rng.uniform(0, span)), o, d, True))
+            events.append((start + float(self.rng.uniform(0, span)), o, d, True, True))
         for _ in range(n_codes):
             o, d = self._code_response()
-            events.append((start + float(self.rng.uniform(0, span)), o, d, True))
+            events.append((start + float(self.rng.uniform(0, span)), o, d, True, False))
         return [e for e in events if e[0] < duration]
 
     def generate(self, scenario: str, duration: float = 600.0, intensity: float = 1.0,
-                 emergency_rate: Optional[float] = None) -> List[Passenger]:
+                 emergency_rate: Optional[float] = None, alert_coverage: float = 1.0,
+                 transfer_space: int = 1) -> List[Passenger]:
+        if not 0.0 <= alert_coverage <= 1.0:
+            raise ValueError("alert_coverage must be between 0 and 1")
+        if not 1 <= transfer_space <= self.cfg.capacity:
+            raise ValueError("transfer_space must fit in a lift")
         spec = SCENARIOS[scenario]
         rate = BASE_RATE_PER_LIFT * self.cfg.num_lifts * spec.rate_factor * intensity
         # emergencies are an external process: `intensity` scales routine traffic only
@@ -191,17 +188,23 @@ class TrafficGenerator:
                    (0.15, self._staff)]
         elif scenario == "shift_change":
             mix = [(0.30, self._lobby_up), (0.30, self._lobby_down), (0.40, self._staff)]
-        elif scenario == "up_peak":
-            mix = [(0.70, self._lobby_up), (0.20, self._inter), (0.10, self._lobby_down)]
-        elif scenario == "down_peak":
-            mix = [(0.70, self._lobby_down), (0.20, self._inter), (0.10, self._lobby_up)]
-        else:   # mixed
-            mix = [(1.0, self._inter)]
+        else:
+            raise ValueError(f"unknown hospital scenario: {scenario}")
 
         events = self._mix(rate, duration, mix)
-        events += self._emergencies(em_rate, duration)
+        emergency_events = self._emergencies(em_rate, duration)
         if scenario == "mass_casualty":
-            events += self._burst(60.0, 60.0, 10, 4, duration)
+            emergency_events += self._burst(60.0, 60.0, 10, 4, duration)
+        if not emergency_events and em_rate > 0 and duration > 0 and self.cfg.critical_floors():
+            # A short random run can otherwise contain no emergency at all.
+            o, d = self._er_transfer()
+            emergency_events.append((duration / 2, o, d, True, True))
+        events += emergency_events
 
         events.sort(key=lambda e: e[0])
-        return [Passenger(i, o, d, t, is_emergency=em) for i, (t, o, d, em) in enumerate(events)]
+        # Separate RNG keeps the passenger stream identical when alert coverage changes.
+        alerts = np.random.default_rng(self.seed + 1000003)
+        return [Passenger(i, o, d, t, is_emergency=em,
+                          clinical_alert=bool(em and alerts.random() < alert_coverage),
+                          space_units=transfer_space if transfer else 1)
+                for i, (t, o, d, em, transfer) in enumerate(events)]

@@ -12,10 +12,11 @@ from ..planner import eta_table, model_from_lift
 from .base import Assignment, Dispatcher
 
 
-def _eligible(lifts):
+def _eligible(lifts, p=None):
     """Conventional rule: in service, not full, not busy with an emergency."""
     return [l for l in lifts if l.state != LiftState.OUT_OF_SERVICE
-            and not l.is_full() and not l.in_lane()]
+            and not l.retiring and not l.is_full() and not l.in_lane()
+            and (p is None or l.has_room_for(p))]
 
 
 class FCFS(Dispatcher):
@@ -26,7 +27,7 @@ class FCFS(Dispatcher):
         out = Assignment()
         extra = {l.id: 0 for l in lifts}
         for p in sorted(unassigned, key=lambda p: p.arrival_time):
-            el = _eligible(lifts)
+            el = _eligible(lifts, p)
             if not el:
                 continue
             best = min(el, key=lambda l: (len(l.stop_floors()) + extra[l.id], l.id))
@@ -42,7 +43,7 @@ class Nearest(Dispatcher):
     def assign(self, unassigned, reassignable, lifts, now, config):
         out = Assignment()
         for p in sorted(unassigned, key=lambda p: p.arrival_time):
-            el = _eligible(lifts)
+            el = _eligible(lifts, p)
             if el:
                 out.lift_for[p.id] = min(el, key=lambda l: (abs(l.floor - p.origin), l.id)).id
         return out
@@ -56,7 +57,7 @@ class Collective(Dispatcher):
     def assign(self, unassigned, reassignable, lifts, now, config):
         out = Assignment()
         for p in sorted(unassigned, key=lambda p: p.arrival_time):
-            el = _eligible(lifts)
+            el = _eligible(lifts, p)
             if not el:
                 continue
             best, best_t = None, 1e18
@@ -81,7 +82,7 @@ class PriorityNearest(Dispatcher):
         order = sorted(unassigned, key=lambda p: (-int(p.urgency), p.arrival_time))
         taken_express = set()
         for p in order:
-            el = [l for l in _eligible(lifts) if l.id not in taken_express]
+            el = [l for l in _eligible(lifts, p) if l.id not in taken_express]
             if not el:
                 continue
             best = min(el, key=lambda l: (abs(l.floor - p.origin), l.id))

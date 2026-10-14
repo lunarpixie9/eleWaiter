@@ -24,29 +24,36 @@ TRAIN_SCENARIOS = ("emergency_surge", "mass_casualty", "visiting_hours")
 TRAIN_SEEDS = (1000, 1001, 1002)
 TRAIN_INTENSITIES = (1.0, 1.8)
 TRAIN_DURATION = 300.0
+TRAIN_ALERT_COVERAGE = 1.0
+TRAIN_TRANSFER_SPACE = 3
 
 
 def composite(r: SimulationResult) -> float:
-    """Lower is better. Balances overall speed, fairness and emergency service."""
+    """Lower is better. Includes full emergency delivery time and missed trips."""
     n = max(1, r.n_total)
     f = r.avg_wait + 0.5 * r.p95_wait + 0.3 * r.wait_std
     f += 3.0 * (r.em_avg_wait or 0.0) + 1.0 * (r.em_p95_wait or 0.0)
+    f += 1.5 * (r.em_avg_journey or 0.0) + 0.5 * (r.em_p95_journey or 0.0)
     if r.em_within_target is not None:
         f += 20.0 * (1.0 - r.em_within_target)
     f += 200.0 * r.starvation_count / n          # 1 % starving = 2 points
     f += 20.0 * r.left_behind / n
+    f += 500.0 * r.n_unserved / n
     return f
 
 
 def fitness(weights: Dict[str, float], config: BuildingConfig,
             scenarios: Sequence[str] = TRAIN_SCENARIOS, seeds: Sequence[int] = TRAIN_SEEDS,
             intensities: Sequence[float] = TRAIN_INTENSITIES,
-            duration: float = TRAIN_DURATION) -> float:
+            duration: float = TRAIN_DURATION, alert_coverage: float = TRAIN_ALERT_COVERAGE,
+            transfer_space: int = TRAIN_TRANSFER_SPACE) -> float:
     tot, k = 0.0, 0
     for sc in scenarios:
         for seed in seeds:
             for inten in intensities:
-                tot += composite(run_once(config, sc, "EleWaiter AI", seed, duration, inten, weights))
+                tot += composite(run_once(config, sc, "EleWaiter AI", seed, duration, inten,
+                                          weights, alert_coverage=alert_coverage,
+                                          transfer_space=transfer_space))
                 k += 1
     return tot / max(1, k)
 
